@@ -40,18 +40,18 @@ class Indexer implements Runnable {
     private final MongoDBRiver river;
     private final MongoDBRiverDefinition definition;
     private final SharedContext context;
-    private final Client client;
+    private final Client esClient;
     private final ScriptService scriptService;
 
     private final Map<SimpleEntry<String, String>, MongoDBRiverBulkProcessor> processors = Maps.newHashMap();
 
-    public Indexer(MongoDBRiver river, MongoDBRiverDefinition definition, SharedContext context, Client client, ScriptService scriptService) {
+    public Indexer(MongoDBRiver river, MongoDBRiverDefinition definition, SharedContext context, Client esClient, ScriptService scriptService) {
         this.river = river;
         this.definition = definition;
         this.context = context;
-        this.client = client;
+        this.esClient = esClient;
         this.scriptService = scriptService;
-        logger.trace(
+        logger.debug(
                 "Create bulk processor with parameters - bulk actions: {} - concurrent request: {} - flush interval: {} - bulk size: {}",
                 definition.getBulk().getBulkActions(), definition.getBulk().getConcurrentRequests(), definition.getBulk()
                         .getFlushInterval(), definition.getBulk().getBulkSize());
@@ -90,7 +90,7 @@ class Indexer implements Runnable {
     private MongoDBRiverBulkProcessor getBulkProcessor(String index, String type) {
         SimpleEntry<String, String> entry = new SimpleEntry<String, String>(index, type);
         if (!processors.containsKey(entry)) {
-            processors.put(new SimpleEntry<String, String>(index, type), new MongoDBRiverBulkProcessor.Builder(river, definition, client,
+            processors.put(new SimpleEntry<String, String>(index, type), new MongoDBRiverBulkProcessor.Builder(river, definition, esClient,
                     index, type).build());
         }
         return processors.get(entry);
@@ -119,7 +119,7 @@ class Indexer implements Runnable {
         } else {
             type = definition.getTypeName();
         }
-        if (MongoDBRiver.OPLOG_COMMAND_OPERATION.equals(operation)) {
+        if (operation == Operation.COMMAND) {
             try {
                 updateBulkRequest(entry.getData(), null, operation, definition.getIndexName(), type, null, null);
             } catch (IOException ioEx) {
@@ -158,12 +158,7 @@ class Indexer implements Runnable {
             entry.getData().put(definition.getIncludeCollection(), definition.getMongoCollection());
         }
 
-        Map<String, Object> ctx = null;
-        try {
-            ctx = XContentFactory.xContent(XContentType.JSON).createParser("{}").mapAndClose();
-        } catch (IOException e) {
-            logger.warn("failed to parse {}", e);
-        }
+        Map<String, Object> ctx = new HashMap<>();
         Map<String, Object> data = entry.getData().toMap();
         if (hasScript()) {
             if (ctx != null) {
@@ -183,16 +178,15 @@ class Indexer implements Runnable {
                     executableScript.run();
                     // we need to unwrap the context object...
                     ctx = (Map<String, Object>) executableScript.unwrap(ctx);
-                    logger.debug("context after script has been executed: {}", ctx);
                 } catch (Exception e) {
                     logger.warn("failed to script process {}, ignoring", e, ctx);
-                    MongoDBRiverHelper.setRiverStatus(client, definition.getRiverName(), Status.SCRIPT_IMPORT_FAILED);
+                    MongoDBRiverHelper.setRiverStatus(esClient, definition.getRiverName(), Status.SCRIPT_IMPORT_FAILED);
                 }
                 if (logger.isTraceEnabled()) {
                     logger.trace("Context after script executed: {}", ctx);
                 }
                 if (isDocumentIgnored(ctx)) {
-                    logger.debug("From script ignore document id: {}", objectId);
+                    logger.trace("From script ignore document id: {}", objectId);
                     // ignore document
                     return lastTimestamp;
                 }
@@ -201,10 +195,10 @@ class Indexer implements Runnable {
                 }
                 if (ctx.containsKey("document")) {
                     data = (Map<String, Object>) ctx.get("document");
-                    logger.debug("From script document: {}", data);
+                    logger.trace("From script document: {}", data);
                 }
                 operation = extractOperation(ctx);
-                logger.debug("From script operation: {} -> {}", ctx.get("operation").toString(), operation);
+                logger.trace("From script operation: {} -> {}", ctx.get("operation").toString(), operation);
             }
         }
 
@@ -233,27 +227,22 @@ class Indexer implements Runnable {
             return;
         }
 
-        boolean isAttachment = false;
-
-        if (logger.isDebugEnabled()) {
-            isAttachment = (data instanceof GridFSDBFile);
-        }
         if (operation == Operation.INSERT) {
             if (logger.isTraceEnabled()) {
-                logger.trace("Insert operation - id: {} - contains attachment: {}", objectId, isAttachment);
+                logger.trace("Insert operation - id: {} - contains attachment: {}", objectId, (data instanceof GridFSDBFile));
             }
             getBulkProcessor(index, type).addBulkRequest(objectId, build(data, objectId), routing, parent);
         }
         // UPDATE = DELETE + INSERT operation
         if (operation == Operation.UPDATE) {
             if (logger.isTraceEnabled()) {
-                logger.trace("Update operation - id: {} - contains attachment: {}", objectId, isAttachment);
+                logger.trace("Update operation - id: {} - contains attachment: {}", objectId, (data instanceof GridFSDBFile));
             }
             deleteBulkRequest(objectId, index, type, routing, parent);
             getBulkProcessor(index, type).addBulkRequest(objectId, build(data, objectId), routing, parent);
         }
         if (operation == Operation.DELETE) {
-            logger.info("Delete request [{}], [{}], [{}]", index, type, objectId);
+            logger.trace("Delete request [{}], [{}], [{}]", index, type, objectId);
             deleteBulkRequest(objectId, index, type, routing, parent);
         }
         if (operation == Operation.DROP_COLLECTION) {
@@ -277,7 +266,7 @@ class Indexer implements Runnable {
 
         if (definition.getParentTypes() != null && definition.getParentTypes().contains(type)) {
             QueryBuilder builder = QueryBuilders.hasParentQuery(type, QueryBuilders.termQuery(MongoDBRiver.MONGODB_ID_FIELD, objectId));
-            SearchResponse response = client.prepareSearch(index).setQuery(builder).setRouting(routing)
+            SearchResponse response = esClient.prepareSearch(index).setQuery(builder).setRouting(routing)
                     .addField(MongoDBRiver.MONGODB_ID_FIELD).execute().actionGet();
             for (SearchHit hit : response.getHits().getHits()) {
                 getBulkProcessor(index, hit.getType()).deleteBulkRequest(hit.getId(), routing, objectId);
@@ -295,8 +284,8 @@ class Indexer implements Runnable {
         if (entry.getData().get(MongoDBRiver.MONGODB_ID_FIELD) != null) {
             objectId = entry.getData().get(MongoDBRiver.MONGODB_ID_FIELD).toString();
         }
-        if (logger.isDebugEnabled()) {
-            logger.debug("applyAdvancedTransformation for id: [{}], operation: [{}]", objectId, operation);
+        if (logger.isTraceEnabled()) {
+            logger.trace("applyAdvancedTransformation for id: [{}], operation: [{}]", objectId, operation);
         }
 
         if (!definition.getIncludeCollection().isEmpty()) {
@@ -339,8 +328,8 @@ class Indexer implements Runnable {
                     // we need to unwrap the context object...
                     ctx = (Map<String, Object>) executableScript.unwrap(ctx);
                 } catch (Exception e) {
-                    logger.warn("failed to script process {}, ignoring", e, ctx);
-                    MongoDBRiverHelper.setRiverStatus(client, definition.getRiverName(), Status.SCRIPT_IMPORT_FAILED);
+                    logger.error("failed to script process {}, ignoring", e, ctx);
+                    MongoDBRiverHelper.setRiverStatus(esClient, definition.getRiverName(), Status.SCRIPT_IMPORT_FAILED);
                 }
                 if (logger.isTraceEnabled()) {
                     logger.trace("Context after script executed: {}", ctx);
@@ -365,8 +354,8 @@ class Indexer implements Runnable {
                             boolean ignore = isDocumentIgnored(item);
                             Map<String, Object> data = (Map<String, Object>) item.get("data");
                             objectId = extractObjectId(data, objectId);
-                            if (logger.isDebugEnabled()) {
-                                logger.debug(
+                            if (logger.isTraceEnabled()) {
+                                logger.trace(
                                         "#### - Id: {} - operation: {} - ignore: {} - index: {} - type: {} - routing: {} - parent: {}",
                                         objectId, operation, ignore, index, type, routing, parent);
                             }
@@ -400,20 +389,20 @@ class Indexer implements Runnable {
     /**
      * Map a DBObject for indexing
      * 
-     * @param base
+     * @param dbObj
      */
-    private Map<String, Object> createObjectMap(DBObject base) {
+    private Map<String, Object> createObjectMap(DBObject dbObj) {
         Map<String, Object> mapData = new HashMap<String, Object>();
-        for (String key : base.keySet()) {
-            Object forMap = base.get(key);
-            if (forMap instanceof DBRef) {
-                mapData.put(key, this.convertDbRef((DBRef) forMap));
-            } else if (forMap instanceof BasicDBList) {
-                mapData.put(key, ((BasicBSONList) forMap).toArray());
-            } else if (forMap instanceof BasicDBObject) {
-                mapData.put(key, this.createObjectMap((DBObject) forMap));
+        for (String key : dbObj.keySet()) {
+            Object value = dbObj.get(key);
+            if (value instanceof DBRef) {
+                mapData.put(key, this.convertDbRef((DBRef) value));
+            } else if (value instanceof BasicDBList) {
+                mapData.put(key, ((BasicBSONList) value).toArray());
+            } else if (value instanceof BasicDBObject) {
+                mapData.put(key, this.createObjectMap((DBObject) value));
             } else {
-                mapData.put(key, forMap);
+                mapData.put(key, value);
             }
         }
 
@@ -474,16 +463,16 @@ class Indexer implements Runnable {
         if (operation == null) {
             return null;
         } else {
-            return Operation.fromString(ctx.get("operation").toString());
+            return Operation.fromString(operation.toString());
         }
     }
 
     private boolean isDocumentIgnored(Map<String, Object> ctx) {
-        return (ctx.containsKey("ignore") && ctx.get("ignore").equals(Boolean.TRUE));
+        return Boolean.TRUE.equals(ctx.get("ignore"));
     }
 
     private boolean isDocumentDeleted(Map<String, Object> ctx) {
-        return (ctx.containsKey("deleted") && ctx.get("deleted").equals(Boolean.TRUE));
+        return Boolean.TRUE.equals(ctx.get("deleted"));
     }
 
     private String extractType(Map<String, Object> ctx, String defaultType) {

@@ -18,21 +18,19 @@ class StatusChecker implements Runnable {
     public void run() {
         while (true) {
             try {
-                if (this.mongoDBRiver.startInvoked) {
-                    Status status = MongoDBRiverHelper.getRiverStatus(this.mongoDBRiver.client, this.definition.getRiverName());
-                    if (status != this.context.getStatus()) {
-                        if (status == Status.RUNNING) {
-                            MongoDBRiver.logger.trace("About to start river: {}", this.definition.getRiverName());
-                            this.mongoDBRiver.start();
-                        } else if (status == Status.STOPPED) {
-                            MongoDBRiver.logger.info("About to stop river: {}", this.definition.getRiverName());
-                            this.mongoDBRiver.close();
-                        }
-                    }
+                Status status = MongoDBRiverHelper.getRiverStatus(this.mongoDBRiver.esClient, this.definition.getRiverName());
+                if (status != this.context.getStatus()) {
+                    if (status == Status.RUNNING) {
+                        MongoDBRiver.logger.trace("About to start river: {}", this.definition.getRiverName());
+                        this.mongoDBRiver.start();
+                    } else if (status == Status.STOPPED) {
+                        MongoDBRiver.logger.info("About to stop river: {}", this.definition.getRiverName());
+                        this.mongoDBRiver.close();
+                     }
                 }
                 Thread.sleep(1000L);
             } catch (InterruptedException e) {
-                MongoDBRiver.logger.info("Status thread interrupted", e, (Object) null);
+                MongoDBRiver.logger.debug("Status thread interrupted", e, (Object) null);
                 Thread.currentThread().interrupt();
                 break;
             }

@@ -3,7 +3,12 @@ package org.elasticsearch.river.mongodb;
 import java.net.UnknownHostException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 import javax.net.SocketFactory;
 import javax.net.ssl.SSLContext;
@@ -48,6 +53,8 @@ public class MongoDBRiverDefinition {
     public final static ByteSizeValue DEFAULT_BULK_SIZE = new ByteSizeValue(5, ByteSizeUnit.MB);
     public final static int DEFAULT_CONNECT_TIMEOUT = 30000;
     public final static int DEFAULT_SOCKET_TIMEOUT = 60000;
+    public final static int DEFAULT_CONNECTIONS_PER_HOST = 100;
+    public final static int DEFAULT_THREADS_ALLOWED_TO_BLOCK_FOR_CONNECTION_MULTIPLIER = 5;
 
     // fields
     public final static String DB_FIELD = "db";
@@ -70,6 +77,8 @@ public class MongoDBRiverDefinition {
     public final static String INITIAL_TIMESTAMP_SCRIPT_FIELD = "script";
     public final static String ADVANCED_TRANSFORMATION_FIELD = "advanced_transformation";
     public final static String SKIP_INITIAL_IMPORT_FIELD = "skip_initial_import";
+    public final static String CONNECTIONS_PER_HOST = "connections_per_host";
+    public final static String THREADS_ALLOWED_TO_BLOCK_FOR_CONNECTION_MULTIPLIER = "threads_allowed_to_block_for_connection_multiplier";
     public final static String PARENT_TYPES_FIELD = "parent_types";
     public final static String STORE_STATISTICS_FIELD = "store_statistics";
     public final static String IMPORT_COLLECTIONS_FIELD = "import_collections";
@@ -79,6 +88,7 @@ public class MongoDBRiverDefinition {
     public final static String CREDENTIALS_FIELD = "credentials";
     public final static String USER_FIELD = "user";
     public final static String PASSWORD_FIELD = "password";
+    public final static String AUTH_FIELD = "auth";
     public final static String SCRIPT_FIELD = "script";
     public final static String SCRIPT_TYPE_FIELD = "script_type";
     public final static String COLLECTION_FIELD = "collection";
@@ -114,8 +124,10 @@ public class MongoDBRiverDefinition {
     // mongodb.credentials
     private final String mongoAdminUser;
     private final String mongoAdminPassword;
+    private final String mongoAdminAuthDatabase;
     private final String mongoLocalUser;
     private final String mongoLocalPassword;
+    private final String mongoLocalAuthDatabase;
 
     // mongodb.options
     private final MongoClientOptions mongoClientOptions;
@@ -166,8 +178,10 @@ public class MongoDBRiverDefinition {
         // mongodb.credentials
         private String mongoAdminUser = "";
         private String mongoAdminPassword = "";
+        private String mongoAdminAuthDatabase = "";
         private String mongoLocalUser = "";
         private String mongoLocalPassword = "";
+        private String mongoLocalAuthDatabase = "";
         // mongodb.options
         private MongoClientOptions mongoClientOptions = null;
         private int connectTimeout = 0;
@@ -200,6 +214,8 @@ public class MongoDBRiverDefinition {
         private int throttleSize;
 
         private Bulk bulk;
+        private int connectionsPerHost;
+        private int threadsAllowedToBlockForConnectionMultiplier;
 
         public Builder mongoServers(List<ServerAddress> mongoServers) {
             this.mongoServers = mongoServers;
@@ -250,6 +266,11 @@ public class MongoDBRiverDefinition {
             this.mongoAdminPassword = mongoAdminPassword;
             return this;
         }
+        
+        public Builder mongoAdminAuthDatabase(String mongoAdminAuthDatabase) {
+            this.mongoAdminAuthDatabase = mongoAdminAuthDatabase;
+            return this;
+        }
 
         public Builder mongoLocalUser(String mongoLocalUser) {
             this.mongoLocalUser = mongoLocalUser;
@@ -258,6 +279,11 @@ public class MongoDBRiverDefinition {
 
         public Builder mongoLocalPassword(String mongoLocalPassword) {
             this.mongoLocalPassword = mongoLocalPassword;
+            return this;
+        }
+        
+        public Builder mongoLocalAuthDatabase(String mongoLocalAuthDatabase) {
+            this.mongoLocalAuthDatabase = mongoLocalAuthDatabase;
             return this;
         }
 
@@ -402,6 +428,16 @@ public class MongoDBRiverDefinition {
             return this;
         }
 
+        public Builder connectionsPerHost(int connectionsPerHost) {
+            this.connectionsPerHost = connectionsPerHost;
+            return this;
+        }
+
+        public Builder threadsAllowedToBlockForConnectionMultiplier(int threadsAllowedToBlockForConnectionMultiplier) {
+            this.threadsAllowedToBlockForConnectionMultiplier = threadsAllowedToBlockForConnectionMultiplier;
+            return this;
+        }
+
         public MongoDBRiverDefinition build() {
             return new MongoDBRiverDefinition(this);
         }
@@ -476,9 +512,9 @@ public class MongoDBRiverDefinition {
 
     @SuppressWarnings("unchecked")
     public synchronized static MongoDBRiverDefinition parseSettings(String riverName, String riverIndexName, RiverSettings settings,
-                                                                    ScriptService scriptService) {
+            ScriptService scriptService) {
 
-        logger.info("Parse river settings for {}", riverName);
+        logger.trace("Parse river settings for {}", riverName);
         Preconditions.checkNotNull(riverName, "No riverName specified");
         Preconditions.checkNotNull(riverIndexName, "No riverIndexName specified");
         Preconditions.checkNotNull(settings, "No settings specified");
@@ -503,7 +539,7 @@ public class MongoDBRiverDefinition {
                     for (Map<String, Object> feed : feeds) {
                         mongoHost = XContentMapValues.nodeStringValue(feed.get(HOST_FIELD), null);
                         mongoPort = XContentMapValues.nodeIntegerValue(feed.get(PORT_FIELD), DEFAULT_DB_PORT);
-                        logger.info("Server: " + mongoHost + " - " + mongoPort);
+                        logger.trace("Server: " + mongoHost + " - " + mongoPort);
                         try {
                             mongoServers.add(new ServerAddress(mongoHost, mongoPort));
                         } catch (UnknownHostException uhEx) {
@@ -522,13 +558,7 @@ public class MongoDBRiverDefinition {
             }
             builder.mongoServers(mongoServers);
 
-            MongoClientOptions.Builder mongoClientOptionsBuilder = MongoClientOptions.builder()/*
-                                                                                                * .
-                                                                                                * autoConnectRetry
-                                                                                                * (
-                                                                                                * true
-                                                                                                * )
-                                                                                                */
+            MongoClientOptions.Builder mongoClientOptionsBuilder = MongoClientOptions.builder()
                     .socketKeepAlive(true);
 
             // MongoDB options
@@ -550,8 +580,15 @@ public class MongoDBRiverDefinition {
                 builder.advancedTransformation(XContentMapValues.nodeBooleanValue(mongoOptionsSettings.get(ADVANCED_TRANSFORMATION_FIELD),
                         false));
                 builder.skipInitialImport(XContentMapValues.nodeBooleanValue(mongoOptionsSettings.get(SKIP_INITIAL_IMPORT_FIELD), false));
+                builder.connectionsPerHost(XContentMapValues.nodeIntegerValue(mongoOptionsSettings.get(CONNECTIONS_PER_HOST), DEFAULT_CONNECTIONS_PER_HOST));
+                builder.threadsAllowedToBlockForConnectionMultiplier(XContentMapValues.nodeIntegerValue(mongoOptionsSettings.get(THREADS_ALLOWED_TO_BLOCK_FOR_CONNECTION_MULTIPLIER),
+                        DEFAULT_THREADS_ALLOWED_TO_BLOCK_FOR_CONNECTION_MULTIPLIER));
 
-                mongoClientOptionsBuilder.connectTimeout(builder.connectTimeout).socketTimeout(builder.socketTimeout);
+                mongoClientOptionsBuilder
+                    .connectTimeout(builder.connectTimeout)
+                    .socketTimeout(builder.socketTimeout)
+                    .connectionsPerHost(builder.connectionsPerHost)
+                    .threadsAllowedToBlockForConnectionMultiplier(builder.threadsAllowedToBlockForConnectionMultiplier);
 
                 if (builder.mongoSecondaryReadPreference) {
                     mongoClientOptionsBuilder.readPreference(ReadPreference.secondaryPreferred());
@@ -564,13 +601,13 @@ public class MongoDBRiverDefinition {
                 if (mongoOptionsSettings.containsKey(PARENT_TYPES_FIELD)) {
                     Set<String> parentTypes = new HashSet<String>();
                     Object parentTypesSettings = mongoOptionsSettings.get(PARENT_TYPES_FIELD);
-                    logger.debug("parentTypesSettings: " + parentTypesSettings);
+                    logger.trace("parentTypesSettings: " + parentTypesSettings);
                     boolean array = XContentMapValues.isArray(parentTypesSettings);
 
                     if (array) {
                         ArrayList<String> fields = (ArrayList<String>) parentTypesSettings;
                         for (String field : fields) {
-                            logger.debug("Field: " + field);
+                            logger.trace("Field: " + field);
                             parentTypes.add(field);
                         }
                     }
@@ -613,13 +650,13 @@ public class MongoDBRiverDefinition {
                 if (mongoOptionsSettings.containsKey(INCLUDE_FIELDS_FIELD)) {
                     Set<String> includeFields = new HashSet<String>();
                     Object includeFieldsSettings = mongoOptionsSettings.get(INCLUDE_FIELDS_FIELD);
-                    logger.debug("includeFieldsSettings: " + includeFieldsSettings);
+                    logger.trace("includeFieldsSettings: " + includeFieldsSettings);
                     boolean array = XContentMapValues.isArray(includeFieldsSettings);
 
                     if (array) {
                         ArrayList<String> fields = (ArrayList<String>) includeFieldsSettings;
                         for (String field : fields) {
-                            logger.debug("Field: " + field);
+                            logger.trace("Field: " + field);
                             includeFields.add(field);
                         }
                     }
@@ -631,13 +668,13 @@ public class MongoDBRiverDefinition {
                 } else if (mongoOptionsSettings.containsKey(EXCLUDE_FIELDS_FIELD)) {
                     Set<String> excludeFields = new HashSet<String>();
                     Object excludeFieldsSettings = mongoOptionsSettings.get(EXCLUDE_FIELDS_FIELD);
-                    logger.debug("excludeFieldsSettings: " + excludeFieldsSettings);
+                    logger.trace("excludeFieldsSettings: " + excludeFieldsSettings);
                     boolean array = XContentMapValues.isArray(excludeFieldsSettings);
 
                     if (array) {
                         ArrayList<String> fields = (ArrayList<String>) excludeFieldsSettings;
                         for (String field : fields) {
-                            logger.debug("Field: " + field);
+                            logger.trace("Field: " + field);
                             excludeFields.add(field);
                         }
                     }
@@ -666,7 +703,7 @@ public class MongoDBRiverDefinition {
                             }
                         }
                     } catch (Throwable t) {
-                        logger.warn("Could set initial timestamp", t, new Object());
+                        logger.error("Could not set initial timestamp", t);
                     } finally {
                         builder.initialTimestamp(timeStamp);
                     }
@@ -679,8 +716,10 @@ public class MongoDBRiverDefinition {
                 String dbCredential;
                 String mau = "";
                 String map = "";
+                String maad = "";
                 String mlu = "";
                 String mlp = "";
+                String mlad = "";
                 // String mdu = "";
                 // String mdp = "";
                 Object mongoCredentialsSettings = mongoSettings.get(CREDENTIALS_FIELD);
@@ -693,9 +732,11 @@ public class MongoDBRiverDefinition {
                         if (ADMIN_DB_FIELD.equals(dbCredential)) {
                             mau = XContentMapValues.nodeStringValue(credential.get(USER_FIELD), null);
                             map = XContentMapValues.nodeStringValue(credential.get(PASSWORD_FIELD), null);
+                            maad = XContentMapValues.nodeStringValue(credential.get(AUTH_FIELD), null);
                         } else if (LOCAL_DB_FIELD.equals(dbCredential)) {
                             mlu = XContentMapValues.nodeStringValue(credential.get(USER_FIELD), null);
                             mlp = XContentMapValues.nodeStringValue(credential.get(PASSWORD_FIELD), null);
+                            mlad = XContentMapValues.nodeStringValue(credential.get(AUTH_FIELD), null);
                             // } else {
                             // mdu = XContentMapValues.nodeStringValue(
                             // credential.get(USER_FIELD), null);
@@ -706,8 +747,10 @@ public class MongoDBRiverDefinition {
                 }
                 builder.mongoAdminUser(mau);
                 builder.mongoAdminPassword(map);
+                builder.mongoAdminAuthDatabase(maad);
                 builder.mongoLocalUser(mlu);
                 builder.mongoLocalPassword(mlp);
+                builder.mongoLocalAuthDatabase(mlad);
                 // mongoDbUser = mdu;
                 // mongoDbPassword = mdp;
             }
@@ -808,7 +851,7 @@ public class MongoDBRiverDefinition {
             sslSocketFactory = sslContext.getSocketFactory();
             return sslSocketFactory;
         } catch (Exception ex) {
-            logger.error("Unable to build ssl socket factory without certificate validation, using default instead.", ex);
+            logger.warn("Unable to build ssl socket factory without certificate validation, using default instead.", ex);
         }
         return SSLSocketFactory.getDefault();
     }
@@ -872,8 +915,10 @@ public class MongoDBRiverDefinition {
         // mongodb.credentials
         this.mongoAdminUser = builder.mongoAdminUser;
         this.mongoAdminPassword = builder.mongoAdminPassword;
+        this.mongoAdminAuthDatabase = builder.mongoAdminAuthDatabase;
         this.mongoLocalUser = builder.mongoLocalUser;
         this.mongoLocalPassword = builder.mongoLocalPassword;
+        this.mongoLocalAuthDatabase = builder.mongoLocalAuthDatabase;
 
         // mongodb.options
         this.mongoClientOptions = builder.mongoClientOptions;
@@ -949,6 +994,10 @@ public class MongoDBRiverDefinition {
     public String getMongoAdminPassword() {
         return mongoAdminPassword;
     }
+    
+    public String getMongoAdminAuthDatabase() {
+        return mongoAdminAuthDatabase;
+    }
 
     public String getMongoLocalUser() {
         return mongoLocalUser;
@@ -956,6 +1005,10 @@ public class MongoDBRiverDefinition {
 
     public String getMongoLocalPassword() {
         return mongoLocalPassword;
+    }
+    
+    public String getMongoLocalAuthDatabase() {
+        return mongoLocalAuthDatabase;
     }
 
     public MongoClientOptions getMongoClientOptions() {

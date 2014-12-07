@@ -17,13 +17,10 @@ import java.util.logging.Logger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.testng.util.Strings;
-
-import com.google.common.base.Joiner;
-
 import de.flapdoodle.embed.process.config.store.IDownloadConfig;
 import de.flapdoodle.embed.process.config.store.ITimeoutConfig;
 import de.flapdoodle.embed.process.distribution.Distribution;
+import de.flapdoodle.embed.process.io.directories.PropertyOrPlatformTempDir;
 import de.flapdoodle.embed.process.io.file.Files;
 import de.flapdoodle.embed.process.io.progress.IProgressListener;
 import de.flapdoodle.embed.process.store.ArtifactStore;
@@ -83,15 +80,15 @@ public class TokuDownloader implements IDownloader {
     openConnection.getInputStream().close();
 
     // Then fetch actual file, using the received cookies
-    File ret = Files.createTempFile(runtime.getFileNaming()
-        .nameFor(runtime.getDownloadPrefix(), "." + runtime.getPackageResolver().getArchiveType(distribution)));
+    File ret = Files.createTempFile(PropertyOrPlatformTempDir.defaultInstance(),
+            runtime.getFileNaming().nameFor(runtime.getDownloadPrefix(), "." + runtime.getPackageResolver().getArchiveType(distribution)));
     logger.fine("Saving distro to " + ret.getAbsolutePath());
     if (ret.canWrite()) {
 
       BufferedOutputStream bos = new BufferedOutputStream(new FileOutputStream(ret));
 
       URL url2 = new URL("http://www.tokutek.com/download.php?df=1");
-      if (!Strings.isNullOrEmpty(refresh)) {
+      if (refresh != null && !refresh.isEmpty()) {
         Matcher m = REFRESH_HEADER_PATTERN.matcher(refresh);
         if (m.matches()) {
           url2 = new URL(url, m.group(1));
@@ -104,7 +101,14 @@ public class TokuDownloader implements IDownloader {
       openConnection.setConnectTimeout(timeoutConfig.getConnectionTimeout());
       openConnection.setReadTimeout(timeoutConfig.getReadTimeout());
       if (!cookies.isEmpty()) {
-        openConnection.setRequestProperty("Cookie", Joiner.on("; ").join(cookies));
+        StringBuilder cookie = new StringBuilder();
+        for (HttpCookie c : cookies) {
+          if (cookie.length() > 0) {
+            cookie.append("; ");
+          }
+          cookie.append(c);
+        }
+        openConnection.setRequestProperty("Cookie", cookie.toString());
       }
 
       InputStream downloadStream = openConnection.getInputStream();

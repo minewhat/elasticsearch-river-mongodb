@@ -55,13 +55,13 @@ public abstract class MongoDBHelper {
         int nRead;
         byte[] data = new byte[1024];
 
-        InputStream stream = file.getInputStream();
-        while ((nRead = stream.read(data, 0, data.length)) != -1) {
-            buffer.write(data, 0, nRead);
-        }
+        try (InputStream stream = file.getInputStream()) {
+            while ((nRead = stream.read(data, 0, data.length)) != -1) {
+                buffer.write(data, 0, nRead);
+            }
 
-        buffer.flush();
-        stream.close();
+            buffer.flush();
+        }
 
         String encodedContent = Base64.encodeBytes(buffer.toByteArray());
 
@@ -70,9 +70,9 @@ public abstract class MongoDBHelper {
 
         builder.startObject();
         builder.startObject("content");
-        builder.field("content_type", file.getContentType());
-        builder.field("title", file.getFilename());
-        builder.field("content", encodedContent);
+        builder.field("_content_type", file.getContentType());
+        builder.field("_title", file.getFilename());
+        builder.field("_content", encodedContent);
         builder.endObject();
         builder.field("filename", file.getFilename());
         builder.field("contentType", file.getContentType());
