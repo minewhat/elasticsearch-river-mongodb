@@ -73,7 +73,14 @@ class CollectionSlurper implements Runnable {
                             importCollection(collection);
                         }
                     }
-                } else {
+                } else if (definition.isImportCollections()) {
+                    for (String name : definition.getImportCollections()) {
+                        if (name.length() < 7 || !name.substring(0, 7).equals("system.")) {
+                            DBCollection collection = slurpedDb.getCollection(name);
+                            importCollection(collection);
+                        }
+                    }
+                } else{
                     DBCollection collection = slurpedDb.getCollection(definition.getMongoCollection());
                     importCollection(collection);
                 }
@@ -110,8 +117,7 @@ class CollectionSlurper implements Runnable {
     }
 
     /**
-     * @throws InterruptedException
-     *             if the blocking queue stream is interrupted while waiting
+     * @throws InterruptedException if the blocking queue stream is interrupted while waiting
      */
     protected void importCollection(DBCollection collection) throws InterruptedException {
         // TODO: ensure the index type is empty
@@ -140,10 +146,10 @@ class CollectionSlurper implements Runnable {
                         DBObject object = cursor.next();
                         count++;
                         if (cursor.hasNext()) {
-                          lastId = addInsertToStream(null, applyFieldFilter(object), collection.getName());
+                            lastId = addInsertToStream(null, applyFieldFilter(object), collection.getName());
                         } else {
-                          logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
-                          lastId = addInsertToStream(timestamp, applyFieldFilter(object), collection.getName());
+                            logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
+                            lastId = addInsertToStream(timestamp, applyFieldFilter(object), collection.getName());
                         }
                     }
                     inProgress = false;
@@ -160,10 +166,10 @@ class CollectionSlurper implements Runnable {
                         if (object instanceof GridFSDBFile) {
                             GridFSDBFile file = grid.findOne(new ObjectId(object.get(MongoDBRiver.MONGODB_ID_FIELD).toString()));
                             if (cursor.hasNext()) {
-                              lastId = addInsertToStream(null, file);
+                                lastId = addInsertToStream(null, file);
                             } else {
-                              logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
-                              lastId = addInsertToStream(timestamp, file);
+                                logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
+                                lastId = addInsertToStream(timestamp, file);
                             }
                         }
                     }
