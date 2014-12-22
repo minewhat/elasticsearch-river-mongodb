@@ -29,7 +29,7 @@ import com.mongodb.gridfs.GridFS;
 import com.mongodb.gridfs.GridFSDBFile;
 import com.mongodb.gridfs.GridFSFile;
 
-class CollectionSlurper implements Runnable {
+class CollectionSlurper {
 
     private static final ESLogger logger = ESLoggerFactory.getLogger(CollectionSlurper.class.getName());
 
@@ -37,12 +37,10 @@ class CollectionSlurper implements Runnable {
     private final SharedContext context;
     private final Client esClient;
     private final MongoClient mongoClient;
-    private Timestamp<?> timestamp;
     private final DB slurpedDb;
     private final AtomicLong totalDocuments = new AtomicLong();
 
-    public CollectionSlurper(Timestamp<?> timestamp, MongoClient mongoClient, MongoDBRiverDefinition definition, SharedContext context, Client esClient) {
-        this.timestamp = timestamp;
+    public CollectionSlurper(MongoClient mongoClient, MongoDBRiverDefinition definition, SharedContext context, Client esClient) {
         this.definition = definition;
         this.context = context;
         this.esClient = esClient;
@@ -50,66 +48,62 @@ class CollectionSlurper implements Runnable {
         this.slurpedDb = mongoClient.getDB(definition.getMongoDb());
     }
 
-    @Override
-    public void run() {
-        if (definition.isSkipInitialImport() || definition.getInitialTimestamp() != null) {
-            logger.info("Skip initial import from collection {}", definition.getMongoCollection());
-        } else if (riverHasIndexedFromOplog()) {
-            logger.trace("Initial import already completed.");
-        } else {
+    /**
+     * Import initial contents from the {@code definition}
+     *
+     * @param timestamp the timestamp to use for the last imported document
+     */
+    public void importInitial(Timestamp<?> timestamp) {
+        try {
+            if (!isIndexEmpty()) {
+                // MongoDB would delete the index and re-attempt the import
+                // We should probably do that too or at least have an option for it
+                // https://groups.google.com/d/msg/mongodb-user/hrOuS-lpMeI/opP6l0gndSEJ
+                logger.error("Cannot import collection {} into existing index", definition.getMongoCollection());
+                MongoDBRiverHelper.setRiverStatus(
+                        esClient, definition.getRiverName(), Status.INITIAL_IMPORT_FAILED);
+                return;
+            }
+            if (definition.isImportAllCollections()) {
+                for (String name : slurpedDb.getCollectionNames()) {
+                    if (name.length() < 7 || !name.substring(0, 7).equals("system.")) {
+                        DBCollection collection = slurpedDb.getCollection(name);
+                        importCollection(collection, timestamp);
+                    }
+                }
+            }
+            else if (definition.isImportCollections()) {
+                for (String name : definition.getImportCollections()) {
+                    if (name.length() < 7 || !name.substring(0, 7).equals("system.")) {
+                        DBCollection collection = slurpedDb.getCollection(name);
+                        importCollection(collection);
+                    }
+                }
+            } else {
+                DBCollection collection = slurpedDb.getCollection(definition.getMongoCollection());
+                importCollection(collection, timestamp);
+            }
+            logger.debug("Before waiting for 500 ms");
+            Thread.sleep(500);
+        } catch (MongoInterruptedException | InterruptedException e) {
+            logger.info("river-mongodb slurper interrupted");
+            Thread.currentThread().interrupt();
+            return;
+        } catch (MongoSocketException | MongoTimeoutException | MongoCursorNotFoundException e) {
+            logger.info("Oplog tailing - {} - {}. Will retry.", e.getClass().getSimpleName(), e.getMessage());
+            logger.debug("Total documents inserted so far by river {}: {}", definition.getRiverName(), totalDocuments.get());
             try {
-                if (!isIndexEmpty()) {
-                    // MongoDB would delete the index and re-attempt the import
-                    // We should probably do that too or at least have an option for it
-                    // https://groups.google.com/d/msg/mongodb-user/hrOuS-lpMeI/opP6l0gndSEJ
-                    MongoDBRiverHelper.setRiverStatus(
-                            esClient, definition.getRiverName(), Status.INITIAL_IMPORT_FAILED);
-                    return;
-                }
-                if (definition.isImportAllCollections()) {
-                    for (String name : slurpedDb.getCollectionNames()) {
-                        if (name.length() < 7 || !name.substring(0, 7).equals("system.")) {
-                            DBCollection collection = slurpedDb.getCollection(name);
-                            importCollection(collection);
-                        }
-                    }
-                } else if (definition.isImportCollections()) {
-                    for (String name : definition.getImportCollections()) {
-                        if (name.length() < 7 || !name.substring(0, 7).equals("system.")) {
-                            DBCollection collection = slurpedDb.getCollection(name);
-                            importCollection(collection);
-                        }
-                    }
-                } else{
-                    DBCollection collection = slurpedDb.getCollection(definition.getMongoCollection());
-                    importCollection(collection);
-                }
-                logger.debug("Before waiting for 500 ms");
-                Thread.sleep(500);
-            } catch (MongoInterruptedException | InterruptedException e) {
+                Thread.sleep(MongoDBRiver.MONGODB_RETRY_ERROR_DELAY_MS);
+            } catch (InterruptedException iEx) {
                 logger.info("river-mongodb slurper interrupted");
                 Thread.currentThread().interrupt();
                 return;
-            } catch (MongoSocketException | MongoTimeoutException | MongoCursorNotFoundException e) {
-                logger.info("Oplog tailing - {} - {}. Will retry.", e.getClass().getSimpleName(), e.getMessage());
-                logger.debug("Total documents inserted so far by river {}: {}", definition.getRiverName(), totalDocuments.get());
-                try {
-                    Thread.sleep(MongoDBRiver.MONGODB_RETRY_ERROR_DELAY_MS);
-                } catch (InterruptedException iEx) {
-                    logger.info("river-mongodb slurper interrupted");
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            } catch (Exception e) {
-                logger.error("Exception while looping in cursor", e);
-                Thread.currentThread().interrupt();
-                return;
             }
+        } catch (Exception e) {
+            logger.error("Exception while looping in cursor", e);
+            Thread.currentThread().interrupt();
+            return;
         }
-    }
-
-    protected boolean riverHasIndexedFromOplog() {
-        return MongoDBRiver.getLastTimestamp(esClient, definition) != null;
     }
 
     protected boolean isIndexEmpty() {
@@ -117,9 +111,14 @@ class CollectionSlurper implements Runnable {
     }
 
     /**
-     * @throws InterruptedException if the blocking queue stream is interrupted while waiting
+     * Import a single collection into the index
+     *
+     * @param collection the collection to import
+     * @param timestamp the timestamp to use for the last imported document
+     * @throws InterruptedException
+     *             if the blocking queue stream is interrupted while waiting
      */
-    protected void importCollection(DBCollection collection) throws InterruptedException {
+    public void importCollection(DBCollection collection, Timestamp<?> timestamp) throws InterruptedException {
         // TODO: ensure the index type is empty
         // DBCollection slurpedCollection =
         // slurpedDb.getCollection(definition.getMongoCollection());
@@ -146,10 +145,10 @@ class CollectionSlurper implements Runnable {
                         DBObject object = cursor.next();
                         count++;
                         if (cursor.hasNext()) {
-                            lastId = addInsertToStream(null, applyFieldFilter(object), collection.getName());
+                          lastId = addInsertToStream(null, applyFieldFilter(object), collection.getName());
                         } else {
-                            logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
-                            lastId = addInsertToStream(timestamp, applyFieldFilter(object), collection.getName());
+                          logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
+                          lastId = addInsertToStream(timestamp, applyFieldFilter(object), collection.getName());
                         }
                     }
                     inProgress = false;
@@ -166,10 +165,10 @@ class CollectionSlurper implements Runnable {
                         if (object instanceof GridFSDBFile) {
                             GridFSDBFile file = grid.findOne(new ObjectId(object.get(MongoDBRiver.MONGODB_ID_FIELD).toString()));
                             if (cursor.hasNext()) {
-                                lastId = addInsertToStream(null, file);
+                              lastId = addInsertToStream(null, file);
                             } else {
-                                logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
-                                lastId = addInsertToStream(timestamp, file);
+                              logger.debug("Last entry for initial import of {} - add timestamp: {}", collection.getFullName(), timestamp);
+                              lastId = addInsertToStream(timestamp, file);
                             }
                         }
                     }
