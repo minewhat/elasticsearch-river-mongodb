@@ -76,7 +76,7 @@ class CollectionSlurper {
                 for (String name : definition.getImportCollections()) {
                     if (name.length() < 7 || !name.substring(0, 7).equals("system.")) {
                         DBCollection collection = slurpedDb.getCollection(name);
-                        importCollection(collection);
+                        importCollection(collection,timestamp);
                     }
                 }
             } else {
